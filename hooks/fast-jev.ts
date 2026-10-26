@@ -296,7 +296,33 @@ export function decisionLogLines(
 type Lookup = {
   env: { get: (name: string) => Promise<string | undefined> };
   settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
+  process?: {
+    run: (argv: readonly string[]) => Promise<{ exitCode: number | null; stdout: string; stderr: string }>;
+  };
 };
+
+/** Keys printed by DECISION_API_KEY_COMMAND, by command, so it runs once per session. */
+const commandKeys = new Map<string, string>();
+
+/**
+ * Runs DECISION_API_KEY_COMMAND through `sh -c` and takes its trimmed stdout
+ * as the key, the way `apiKeyHelper` works, so the key itself never sits in
+ * a settings file. Throws when the command fails or prints nothing.
+ */
+async function keyFromCommand($: Lookup, command: string): Promise<string> {
+  const cached = commandKeys.get(command);
+  if (cached) return cached;
+  if (!$.process) throw new Error('DECISION_API_KEY_COMMAND needs $.process');
+  const { exitCode, stdout, stderr } = await $.process.run(['sh', '-c', command]);
+  const key = stdout.trim();
+  if (exitCode !== 0 || !key) {
+    throw new Error(
+      `DECISION_API_KEY_COMMAND failed (exit ${exitCode}): ${stderr.trim().slice(0, 200)}`,
+    );
+  }
+  commandKeys.set(command, key);
+  return key;
+}
 
 /** `env` in the Claude Code settings, which backs up the process environment. */
 async function settingsEnv($: Lookup): Promise<Record<string, string>> {
@@ -312,8 +338,8 @@ async function settingsEnv($: Lookup): Promise<Record<string, string>> {
  * cascade and Jev.
  *
  * The hosted chain is DECISION_BASE_URL with DECISION_MODELS (a comma list,
- * best first) and DECISION_API_KEY, or the `baseUrl`/`models`/`apiKey`
- * options. DECISION_FALLBACK_URL adds an OpenAI-compatible fallback model
+ * best first) and DECISION_API_KEY (or DECISION_API_KEY_COMMAND, whose
+ * stdout is the key), or the `baseUrl`/`models`/`apiKey` options. DECISION_FALLBACK_URL adds an OpenAI-compatible fallback model
  * (DECISION_FALLBACK_MODEL, default `Qwen/Qwen3.5-4B`), which also works
  * alone. Either one switches from Jev, with state budgets a decision model
  * will not truncate. Otherwise the key is TYPESAFE_API_KEY and Jev is asked.
@@ -324,6 +350,7 @@ export async function resolveRuntimeConfig($: Lookup, configured: HookConfig): P
     DECISION_BASE_URL: await $.env.get('DECISION_BASE_URL'),
     DECISION_MODELS: await $.env.get('DECISION_MODELS'),
     DECISION_API_KEY: await $.env.get('DECISION_API_KEY'),
+    DECISION_API_KEY_COMMAND: await $.env.get('DECISION_API_KEY_COMMAND'),
     DECISION_FALLBACK_URL: await $.env.get('DECISION_FALLBACK_URL'),
     DECISION_FALLBACK_MODEL: await $.env.get('DECISION_FALLBACK_MODEL'),
     TYPESAFE_API_KEY: await $.env.get('TYPESAFE_API_KEY'),
@@ -346,7 +373,11 @@ export async function resolveRuntimeConfig($: Lookup, configured: HookConfig): P
   if (hosted && baseUrl) {
     config.baseUrl = baseUrl;
     config.models = models;
-    const apiKey = configured.apiKey ?? get('DECISION_API_KEY');
+    const command = get('DECISION_API_KEY_COMMAND');
+    const apiKey =
+      configured.apiKey ??
+      get('DECISION_API_KEY') ??
+      (command ? await keyFromCommand($, command) : undefined);
     if (apiKey) config.apiKey = apiKey;
   }
   if (fallbackUrl) {

@@ -213,6 +213,27 @@ describe('decision endpoint', () => {
     expect(config.fallback).toBeUndefined();
   });
 
+  it('runs DECISION_API_KEY_COMMAND once for the key and reports its failure', async () => {
+    const runs: string[][] = [];
+    const lookup = {
+      ...host({ DECISION_BASE_URL: 'https://decide.test', DECISION_MODELS: 'a', DECISION_API_KEY_COMMAND: 'print-key' }),
+      process: {
+        run: async (argv: readonly string[]) => {
+          runs.push([...argv]);
+          return { exitCode: 0, stdout: 'ck\n', stderr: '' };
+        },
+      },
+    };
+    expect((await resolveRuntimeConfig(lookup, resolveHookConfig({}))).apiKey).toBe('ck');
+    expect((await resolveRuntimeConfig(lookup, resolveHookConfig({}))).apiKey).toBe('ck');
+    expect(runs).toEqual([['sh', '-c', 'print-key']]);
+    const failing = {
+      ...host({ DECISION_BASE_URL: 'https://decide.test', DECISION_MODELS: 'a', DECISION_API_KEY_COMMAND: 'nope' }),
+      process: { run: async () => ({ exitCode: 1, stdout: '', stderr: 'denied' }) },
+    };
+    await expect(resolveRuntimeConfig(failing, resolveHookConfig({}))).rejects.toThrow(/exit 1\): denied/);
+  });
+
   it('adds the fallback model from DECISION_FALLBACK_URL, and keeps budgets the user set', async () => {
     const config = await resolveRuntimeConfig(
       host({ DECISION_FALLBACK_URL: 'http://fallback.test:8000/', DECISION_FALLBACK_MODEL: ' ' }),

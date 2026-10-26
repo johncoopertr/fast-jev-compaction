@@ -176,6 +176,8 @@ body (`{ state, questions }` with `noul` questions) and answer
 export DECISION_BASE_URL="https://decide.example.com/v1"
 export DECISION_MODELS="model-a,model-b,model-c"   # best first
 export DECISION_API_KEY="<key>"                    # sent as x-api-key
+# or, to keep the key out of settings, a command that prints it:
+# export DECISION_API_KEY_COMMAND="pass show decision-key"
 # Optional last resort, also usable alone:
 export DECISION_FALLBACK_URL="http://fallback.example:8000"
 export DECISION_FALLBACK_MODEL="Qwen/Qwen3.5-4B"   # the default
