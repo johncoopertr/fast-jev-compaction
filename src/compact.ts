@@ -120,11 +120,12 @@ async function askBatch(
   asker: JevAsker,
   state: CompactionState,
   batch: readonly ToolCall[],
-): Promise<{ model: string | undefined; answers: Map<string, CallAnswer> }> {
+): Promise<{ model: string | undefined; skipped: string[]; answers: Map<string, CallAnswer> }> {
   const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
-  const { answers, model } = await asker.ask(state, questions);
+  const { answers, model, skipped } = await asker.ask(state, questions);
   return {
     model: typeof model === 'string' ? model : undefined,
+    skipped: Array.isArray(skipped) ? skipped.filter((s): s is string => typeof s === 'string') : [],
     answers: new Map(
       batch.map((call) => [
         call.id,
@@ -274,6 +275,7 @@ export async function compact(
   let batches: ToolCall[][] = [];
   const answers = new Map<string, CallAnswer>();
   const models: Record<string, number> = {};
+  const skipped = new Set<string>();
   if (candidates.length > 0) {
     const state = fitState(messages, calls, resolved);
     fitted = state;
@@ -283,6 +285,7 @@ export async function compact(
     );
     for (const batch of answered) {
       if (batch.model) models[batch.model] = (models[batch.model] ?? 0) + 1;
+      for (const entry of batch.skipped) skipped.add(entry);
       for (const [id, answer] of batch.answers) answers.set(id, answer);
     }
   }
@@ -313,6 +316,7 @@ export async function compact(
       stateStage: fitted.stage,
       requests: batches.length,
       models,
+      skipped: [...skipped],
       ms: Date.now() - started,
     },
   };

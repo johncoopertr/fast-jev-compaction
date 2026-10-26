@@ -139,6 +139,8 @@ export interface CompactResult {
     requests: number;
     /** Requests answered per model, by the name it reported. */
     models: Record<string, number>;
+    /** Hosted models passed over before one answered, as `model: reason`. */
+    skipped: string[];
     ms: number;
   };
 }

@@ -187,7 +187,7 @@ describe('compactSession', () => {
       return { status: 200, ok: true, text: JSON.stringify(reply) };
     };
     const { result: output } = await compactSession(big, config, fetchFn);
-    expect(summarize(output)).toMatch(/ by fallback:q/);
+    expect(summarize(output)).toMatch(/ by fallback:q x3; skipped cold: cold$/);
     expect(urls.some((url) => url.startsWith('http://fallback.test'))).toBe(true);
   });
 });
@@ -302,7 +302,7 @@ describe('decision endpoint', () => {
     });
     expect(new Set(urls)).toEqual(new Set(['http://fallback.test/v1/chat/completions']));
     expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
-    expect(summarize(output)).toMatch(/ by fallback:q$/);
+    expect(summarize(output)).toMatch(/ by fallback:q; skipped hosted chain: no key or base URL$/);
   });
 
   it('asks the models in order over the engine fetch and skips the cold one', async () => {

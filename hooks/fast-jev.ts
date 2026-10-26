@@ -284,7 +284,7 @@ export function summarize(result: CompactResult): string {
     parts.join(', ') || 'no tool calls'
   }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)${
     models ? ` by ${models}` : ''
-  }`;
+  }${stats.skipped.length > 0 ? `; skipped ${stats.skipped.join(', ')}` : ''}`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
