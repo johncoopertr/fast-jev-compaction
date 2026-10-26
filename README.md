@@ -205,9 +205,23 @@ export DECISION_FALLBACK_MODEL="Qwen/Qwen3.5-4B"   # the default
   runs at `compactAtPercent`.
 - When nothing answers, the hook falls back to Claude Code's built-in summary.
   The toast names the model(s) that answered.
+- Every call is reported in the transcript as it is made, so a cascade that
+  waits on one model at a time is visible while it runs:
 
-In code, use `new CascadeAsker({ apiKey, baseUrl, models, fallback, transport: fetchTransport() })`
-with `compact()`, and pass `maxStateChars` to `compact()`.
+  ```
+  asking model-a (16 questions, 41203 chars of state)
+  model-a skipped after 0.1 s: cold
+  asking model-b (16 questions, 41203 chars of state)
+  model-b answered 16 questions in 3.4 s
+  ```
+
+  The model in flight is pinned as the plugin's status line, the wake-up logs
+  one line per model, and `CascadeOptions.onEvent` gives the same stream to
+  library callers.
+
+In code, use `new CascadeAsker({ apiKey, baseUrl, models, fallback, onEvent, transport: fetchTransport() })`
+with `compact()`, and pass `maxStateChars` to `compact()`. `onEvent` receives a
+`CascadeEvent` (`ask`, `answer` or `skip`) for every model the cascade touches.
 
 `keepThreshold` was tuned for Jev; other models' probabilities are shaped
 differently, so it may want retuning.

@@ -8,6 +8,7 @@ import {
   parseModelList,
   stripThinking,
   wakeModels,
+  type CascadeEvent,
   type CascadeTransport,
   type JevQuestions,
   type Message,
@@ -316,6 +317,84 @@ describe('fallback model', () => {
   });
 });
 
+describe('cascade reporting', () => {
+  it('reports every model asked, how long it took and why it was passed over', async () => {
+    const events: CascadeEvent[] = [];
+    const response = await new CascadeAsker({
+      apiKey: 'k',
+      baseUrl: 'https://decide.test/v1',
+      models: ['a', 'b', 'c'],
+      transport: scripted({
+        a: { status: 503, text: 'scaling' },
+        b: { status: 500, text: 'boom' },
+        c: { status: 200, text: answering(0.7) },
+      }),
+      onEvent: (event) => events.push(event),
+    }).ask({}, questions);
+    expect(response.model).toBe('c');
+    expect(events.map((event) => [event.type, event.model])).toEqual([
+      ['ask', 'a'],
+      ['skip', 'a'],
+      ['ask', 'b'],
+      ['skip', 'b'],
+      ['ask', 'c'],
+      ['answer', 'c'],
+    ]);
+    expect(events.filter((event) => event.type === 'skip').map((event) => event.reason)).toEqual([
+      'cold',
+      'Jev request failed (500): boom',
+    ]);
+    const asked = events[0];
+    expect(asked.type === 'ask' && asked.questions).toBe(2);
+    const answered = events[5];
+    expect(answered.type === 'answer' && answered.reported).toBe('c');
+  });
+
+  it('reports a model skipped for state length without asking it, and the fallback', async () => {
+    const events: CascadeEvent[] = [];
+    const reply = {
+      choices: [
+        {
+          message: { content: 'yes' },
+          logprobs: {
+            content: [
+              { token: 'yes', top_logprobs: [{ token: 'yes', logprob: -0.1 }, { token: 'no', logprob: -3 }] },
+            ],
+          },
+        },
+      ],
+    };
+    const response = await new CascadeAsker({
+      apiKey: 'k',
+      baseUrl: 'https://decide.test/v1',
+      models: ['a'],
+      limits: { a: { maxStateChars: 5 } },
+      fallback: { baseUrl: 'http://fallback.test', model: 'q' },
+      transport: async () => ({ status: 200, ok: true, text: JSON.stringify(reply) }),
+      onEvent: (event) => events.push(event),
+    }).ask('a state longer than five characters', questions);
+    expect(response.model).toBe('fallback:q');
+    expect(events.map((event) => [event.type, event.model, event.type === 'skip' ? event.reason : ''])).toEqual([
+      ['skip', 'a', 'state too long (35 > 5 chars)'],
+      ['ask', 'fallback:q', ''],
+      ['answer', 'fallback:q', ''],
+    ]);
+  });
+
+  it('is unaffected by a watcher that throws', async () => {
+    const response = await new CascadeAsker({
+      apiKey: 'k',
+      baseUrl: 'https://decide.test/v1',
+      models: ['a'],
+      transport: scripted({ a: { status: 200, text: answering(0.5) } }),
+      onEvent: () => {
+        throw new Error('watcher broke');
+      },
+    }).ask({}, questions);
+    expect(response.model).toBe('a');
+  });
+});
+
 describe('wake-up', () => {
   it('leaves ready models alone and sends the rest a throwaway question', async () => {
     const seen: { method: string; url: string }[] = [];
@@ -329,10 +408,27 @@ describe('wake-up', () => {
         return { status: 503, ok: false, text: '' };
       },
     );
-    expect(woken).toEqual(['cold', 'down']);
+    expect(woken).toEqual([
+      { model: 'warm', outcome: 'ready' },
+      { model: 'cold', outcome: 'woken' },
+      { model: 'down', outcome: 'woken' },
+    ]);
     expect(seen.filter((s) => s.method === 'POST').map((s) => s.url)).toEqual([
       'https://decide.test/v1/cold',
       'https://decide.test/v1/down',
+    ]);
+  });
+
+  it('reports a wake-up that could not be sent instead of throwing', async () => {
+    const woken = await wakeModels(
+      { apiKey: 'k', baseUrl: 'https://decide.test/v1', models: ['gone'] },
+      async (_url, init) => {
+        if (init.method === 'POST') throw new Error('connect ECONNREFUSED');
+        return { status: 500, ok: false, text: '' };
+      },
+    );
+    expect(woken).toEqual([
+      { model: 'gone', outcome: 'failed', detail: 'connect ECONNREFUSED' },
     ]);
   });
 });

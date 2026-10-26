@@ -48,6 +48,40 @@ export type CascadeTransport = (
   init: CascadeInit,
 ) => Promise<{ status: number; ok: boolean; text: string }>;
 
+/** Where a call went: the hosted chain, or the fallback server. */
+export type CascadeSource = 'hosted' | 'fallback';
+
+/**
+ * One decision-model call as it happens, so a host can show which model is
+ * asked and how it answered instead of only the cascade's verdict.
+ *
+ * `model` is the name the cascade asked under (`fallback:<model>` for the
+ * fallback); `reported` on an answer is the name the server replied with,
+ * which differs when the endpoint resolves an alias.
+ */
+export type CascadeEvent =
+  | { type: 'ask'; model: string; source: CascadeSource; questions: number; stateChars: number }
+  | {
+      type: 'answer';
+      model: string;
+      source: CascadeSource;
+      reported: string;
+      questions: number;
+      ms: number;
+    }
+  | { type: 'skip'; model: string; source: CascadeSource; reason: string; ms: number };
+
+/** What one model did when `wakeModels` reached it. */
+export type WakeOutcome = 'ready' | 'woken' | 'failed';
+
+/** One model's outcome from `wakeModels`. */
+export interface WakeResult {
+  model: string;
+  outcome: WakeOutcome;
+  /** Why the wake-up failed; absent otherwise. */
+  detail?: string;
+}
+
 /** The fallback model: an OpenAI-compatible server and the alias it serves. */
 export interface FallbackEndpoint {
   baseUrl: string;
@@ -77,6 +111,12 @@ export interface CascadeOptions {
    * it the transport's own limit applies (`fetchTransport` sets one).
    */
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Called as each model is asked and as it answers or is skipped, so a host
+   * reports the cascade while it runs. It never changes the outcome: what it
+   * throws is swallowed.
+   */
+  onEvent?: (event: CascadeEvent) => void;
 }
 
 /** `a, b ,c` into `['a', 'b', 'c']`; blanks and repeats dropped. */
@@ -216,6 +256,15 @@ export class CascadeAsker implements JevAsker {
     return turn;
   }
 
+  /** Reports one call to `onEvent`; a watcher that throws never stops a decision. */
+  private emit(event: CascadeEvent): void {
+    try {
+      this.options.onEvent?.(event);
+    } catch {
+      // A watcher is a spectator, never a dependency.
+    }
+  }
+
   private async call(url: string, init: CascadeInit) {
     const ms = this.options.timeoutMs ?? PER_MODEL_TIMEOUT_MS;
     const sleep = this.options.sleep;
@@ -235,9 +284,19 @@ export class CascadeAsker implements JevAsker {
     for (const model of this.models) {
       const limits = { ...DEFAULT_MODEL_LIMITS, ...this.options.limits?.[model] };
       if (chars > limits.maxStateChars) {
-        skipped.push(`${model}: state too long (${chars} > ${limits.maxStateChars} chars)`);
+        const reason = `state too long (${chars} > ${limits.maxStateChars} chars)`;
+        skipped.push(`${model}: ${reason}`);
+        this.emit({ type: 'skip', model, source: 'hosted', reason, ms: 0 });
         continue;
       }
+      const started = Date.now();
+      this.emit({
+        type: 'ask',
+        model,
+        source: 'hosted',
+        questions: names.length,
+        stateChars: chars,
+      });
       try {
         const answers: Record<string, JevAnswer> = {};
         let reported: string | undefined;
@@ -267,24 +326,63 @@ export class CascadeAsker implements JevAsker {
         }
         if (problem) {
           skipped.push(`${model}: ${problem}`);
+          this.emit({
+            type: 'skip',
+            model,
+            source: 'hosted',
+            reason: problem,
+            ms: Date.now() - started,
+          });
           continue;
         }
+        this.emit({
+          type: 'answer',
+          model,
+          source: 'hosted',
+          reported: reported ?? model,
+          questions: names.length,
+          ms: Date.now() - started,
+        });
         return { model: reported ?? model, answers, skipped };
       } catch (error) {
-        skipped.push(`${model}: ${error instanceof Error ? error.message : String(error)}`);
+        const reason = error instanceof Error ? error.message : String(error);
+        skipped.push(`${model}: ${reason}`);
+        this.emit({ type: 'skip', model, source: 'hosted', reason, ms: Date.now() - started });
       }
     }
     if (this.models.length === 0) skipped.push('hosted chain: no key or base URL');
 
     const fallback = this.options.fallback;
     const fallbackLimit = fallback?.maxStateChars ?? DEFAULT_FALLBACK_MAX_STATE_CHARS;
+    const name = fallback ? `fallback:${fallback.model}` : '';
     if (fallback && chars > fallbackLimit) {
-      skipped.push(`fallback:${fallback.model}: state too long (${chars} > ${fallbackLimit} chars)`);
+      const reason = `state too long (${chars} > ${fallbackLimit} chars)`;
+      skipped.push(`${name}: ${reason}`);
+      this.emit({ type: 'skip', model: name, source: 'fallback', reason, ms: 0 });
     } else if (fallback) {
+      const started = Date.now();
+      this.emit({
+        type: 'ask',
+        model: name,
+        source: 'fallback',
+        questions: names.length,
+        stateChars: chars,
+      });
       try {
-        return { ...(await this.askFallback(fallback, state, questions)), skipped };
+        const answer = await this.askFallback(fallback, state, questions);
+        this.emit({
+          type: 'answer',
+          model: name,
+          source: 'fallback',
+          reported: answer.model ?? name,
+          questions: names.length,
+          ms: Date.now() - started,
+        });
+        return { ...answer, skipped };
       } catch (error) {
-        skipped.push(`fallback:${fallback.model}: ${error instanceof Error ? error.message : String(error)}`);
+        const reason = error instanceof Error ? error.message : String(error);
+        skipped.push(`${name}: ${reason}`);
+        this.emit({ type: 'skip', model: name, source: 'fallback', reason, ms: Date.now() - started });
       }
     }
     throw new Error(`no decision model answered (${skipped.join('; ')})`);
@@ -346,27 +444,28 @@ export class CascadeAsker implements JevAsker {
 }
 
 /**
- * Starts cold hosted models scaling up without asking them anything real
+ * Starts cold hosted models scaling up without asking them anything real.
  * A status check does not start a model; only a request that
  * finds it cold does, so a model reporting `ready` is left alone and the rest
- * are sent a throwaway question. Failures are ignored: this is a speculative
- * kick, never a dependency. Resolves the models it sent a wake-up.
+ * are sent a throwaway question. Failures are reported, never thrown: this is
+ * a speculative kick, never a dependency. Resolves one result per model, in
+ * the order they were given, so a host can show what each one did.
  */
 export async function wakeModels(
   params: { apiKey: string; baseUrl: string; models: readonly string[]; auth?: CascadeAuth },
   transport: CascadeTransport,
-): Promise<string[]> {
+): Promise<WakeResult[]> {
   const base = trimBase(params.baseUrl);
   const headers = authHeaders(params.apiKey, params.auth);
-  const woken = await Promise.all(
-    params.models.map(async (model) => {
+  return Promise.all(
+    params.models.map(async (model): Promise<WakeResult> => {
       try {
         const status = await transport(`${base}/${encodeURIComponent(model)}/status`, {
           method: 'GET',
           headers,
         });
         if (status.ok && (JSON.parse(status.text) as { ready?: unknown }).ready === true) {
-          return undefined;
+          return { model, outcome: 'ready' };
         }
       } catch {
         // Readiness unknown: send the wake-up anyway.
@@ -376,11 +475,14 @@ export async function wakeModels(
           wake: { type: 'noul', instructions: 'Is this a wake-up?' },
         });
         await transport(url, init);
-      } catch {
-        return undefined;
+      } catch (error) {
+        return {
+          model,
+          outcome: 'failed',
+          detail: error instanceof Error ? error.message : String(error),
+        };
       }
-      return model;
+      return { model, outcome: 'woken' };
     }),
   );
-  return woken.filter((model): model is string => model !== undefined);
 }

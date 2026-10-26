@@ -14,7 +14,9 @@ import {
   parseModelList,
   wakeModels,
   type CascadeAuth,
+  type CascadeEvent,
   type FallbackEndpoint,
+  type WakeResult,
 } from '../src/cascade.js';
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
@@ -196,6 +198,13 @@ export function toSessionMessages(
   });
 }
 
+/**
+ * What the hook reports while a compaction runs: every decision-model call the
+ * cascade makes, plus the retry it starts when a cold chain leaves only the
+ * fallback and the state was sized for the hosted models.
+ */
+export type HookEvent = CascadeEvent | { type: 'retry'; reason: string; maxStateChars: number };
+
 export type SessionCompaction = {
   result: CompactResult;
   messages: SessionMessage[];
@@ -209,6 +218,7 @@ function askerFor(
   config: HookConfig,
   fetchFn: HookFetch,
   sleep?: (ms: number) => Promise<void>,
+  onEvent?: (event: HookEvent) => void,
 ): JevAsker {
   if (isCascade(config)) {
     return new CascadeAsker({
@@ -218,6 +228,7 @@ function askerFor(
       ...(config.authHeader ? { auth: config.authHeader } : {}),
       ...(config.fallback ? { fallback: config.fallback } : {}),
       ...(sleep ? { sleep } : {}),
+      ...(onEvent ? { onEvent } : {}),
       transport: (url, init) => fetchFn(url, init),
     });
   }
@@ -231,9 +242,10 @@ export async function compactSession(
   config: HookConfig,
   fetchFn: HookFetch,
   sleep?: (ms: number) => Promise<void>,
+  onEvent?: (event: HookEvent) => void,
 ): Promise<SessionCompaction> {
   try {
-    const result = await compact(messages, askerFor(config, fetchFn, sleep), config);
+    const result = await compact(messages, askerFor(config, fetchFn, sleep, onEvent), config);
     return { result, messages: toSessionMessages(messages, result.messages) };
   } catch (error) {
     // Every hosted model cold or failing, and the fallback skipped because the
@@ -241,7 +253,12 @@ export async function compactSession(
     // fallback model can take, so a cold cascade still yields a real decision.
     const smaller = fallbackSized(config);
     if (!smaller) throw error;
-    const result = await compact(messages, askerFor(smaller, fetchFn, sleep), smaller);
+    onEvent?.({
+      type: 'retry',
+      reason: error instanceof Error ? error.message : String(error),
+      maxStateChars: smaller.maxStateChars ?? FALLBACK_BUDGETS.maxStateChars,
+    });
+    const result = await compact(messages, askerFor(smaller, fetchFn, sleep, onEvent), smaller);
     return { result, messages: toSessionMessages(messages, result.messages) };
   }
 }
@@ -267,6 +284,38 @@ function fallbackSized(config: HookConfig): HookConfig | undefined {
 
 function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
+}
+
+function seconds(ms: number): string {
+  return `${(ms / 1000).toFixed(1)} s`;
+}
+
+/** One transcript line for a decision-model call: which model, and how it answered. */
+export function eventLine(event: HookEvent): string {
+  switch (event.type) {
+    case 'ask':
+      return `asking ${event.model} (${event.questions} questions, ${event.stateChars} chars of state)`;
+    case 'answer':
+      return `${event.model} answered ${event.questions} questions in ${seconds(event.ms)}${
+        event.reported !== event.model ? ` (served by ${event.reported})` : ''
+      }`;
+    case 'skip':
+      return `${event.model} skipped${event.ms > 0 ? ` after ${seconds(event.ms)}` : ''}: ${event.reason}`;
+    case 'retry':
+      return `retrying with a ${event.maxStateChars}-char state the fallback model can take (${event.reason})`;
+  }
+}
+
+/** One transcript line per model the wake-up reached, and what it did. */
+export function wakeLine(result: WakeResult): string {
+  switch (result.outcome) {
+    case 'ready':
+      return `${result.model} is already warm`;
+    case 'woken':
+      return `sent a wake-up to ${result.model}`;
+    case 'failed':
+      return `wake-up to ${result.model} failed: ${result.detail ?? 'unknown error'}`;
+  }
 }
 
 export function summarize(result: CompactResult): string {
@@ -450,7 +499,17 @@ export const register: Register = (on: On, options: PluginOptions) => {
           return { status: response.status, ok: response.ok, text: response.text };
         },
         (ms) => $.clock.sleep(ms, { signal: next.signal }),
+        // Every decision-model call as it happens: a cascade waits on models
+        // one at a time, so without this the session shows nothing until the
+        // last of them has answered or been skipped.
+        (hookEvent) => {
+          $.ui.log(eventLine(hookEvent));
+          $.ui.status(
+            hookEvent.type === 'ask' ? `compacting: asking ${hookEvent.model}` : undefined,
+          );
+        },
       );
+      $.ui.status(undefined);
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(
@@ -465,6 +524,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       );
       return { messages };
     } catch (error) {
+      $.ui.status(undefined);
       notify(
         $,
         `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
@@ -485,7 +545,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         const config = await resolveRuntimeConfig($, configured);
         if (now - lastWake >= WAKE_EVERY_MS && config.apiKey && config.baseUrl && config.models) {
           lastWake = now;
-          const woken = await wakeModels(
+          const wake = await wakeModels(
             {
               apiKey: config.apiKey,
               baseUrl: config.baseUrl,
@@ -497,7 +557,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
               return { status: response.status, ok: response.ok, text: response.text };
             },
           );
-          if (woken.length > 0) $.ui.log(`sent a wake-up to ${woken.join(', ')}`);
+          for (const result of wake) $.ui.log(wakeLine(result));
         }
       }
       if (used < configured.compactAtPercent) return next(event);

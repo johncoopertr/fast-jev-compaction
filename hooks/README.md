@@ -81,7 +81,23 @@ fitted into the state budget, or the estimated reduction is below
 `minReductionRatio`, the hook logs a fallback and delegates to Claude Code's
 built-in compaction. The outcome is shown as a toast and logged with the
 reduction, per-reason counts, state size and request count; a per-call
-`decisions:` line with both probabilities is logged for diagnosis. The
+`decisions:` line with both probabilities is logged for diagnosis.
+
+Every decision-model call is logged as it happens, so a cascade is visible
+while it runs rather than only in the closing toast:
+
+```
+asking jev-decider-8b (16 questions, 41203 chars of state)
+jev-decider-8b skipped after 0.1 s: cold
+asking jev-decider-4b (16 questions, 41203 chars of state)
+jev-decider-4b answered 16 questions in 3.4 s
+```
+
+The model being asked is also pinned as the plugin's status line until it
+answers. A model the endpoint resolves to another name reports it
+(`served by …`); the retry with a fallback-sized state logs its own line; and
+the wake-up logs one line per model (`already warm`, `sent a wake-up to`, or
+why it failed). The
 `turn.complete` hook requests
 compaction when `context.percent` reaches `compactAtPercent`, with an
 in-flight guard.

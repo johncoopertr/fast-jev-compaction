@@ -3,6 +3,8 @@ import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  eventLine,
+  wakeLine,
   resolveHookConfig,
   resolveRuntimeConfig,
   summarize,
@@ -186,9 +188,48 @@ describe('compactSession', () => {
       expect(init?.body?.length ?? 0).toBeLessThan(20_000);
       return { status: 200, ok: true, text: JSON.stringify(reply) };
     };
-    const { result: output } = await compactSession(big, config, fetchFn);
+    const lines: string[] = [];
+    const { result: output } = await compactSession(big, config, fetchFn, undefined, (event) =>
+      lines.push(eventLine(event)),
+    );
     expect(summarize(output)).toMatch(/ by fallback:q x3; skipped cold: cold$/);
     expect(urls.some((url) => url.startsWith('http://fallback.test'))).toBe(true);
+    expect(lines[0]).toMatch(/^asking cold \(\d+ questions, \d+ chars of state\)$/);
+    expect(lines).toContain('cold skipped after 0.0 s: cold');
+    expect(lines.some((line) => line.startsWith('retrying with a 12000-char state'))).toBe(true);
+    expect(lines.some((line) => /^fallback:q answered \d+ questions in /.test(line))).toBe(true);
+  });
+});
+
+describe('reported lines', () => {
+  it('names the model and what it did on every call', () => {
+    expect(eventLine({ type: 'ask', model: 'a', source: 'hosted', questions: 8, stateChars: 41203 })).toBe(
+      'asking a (8 questions, 41203 chars of state)',
+    );
+    expect(
+      eventLine({ type: 'answer', model: 'a', source: 'hosted', reported: 'a', questions: 8, ms: 3400 }),
+    ).toBe('a answered 8 questions in 3.4 s');
+    expect(
+      eventLine({ type: 'answer', model: 'a', source: 'hosted', reported: 'a-v2', questions: 8, ms: 3400 }),
+    ).toBe('a answered 8 questions in 3.4 s (served by a-v2)');
+    expect(eventLine({ type: 'skip', model: 'a', source: 'hosted', reason: 'cold', ms: 210 })).toBe(
+      'a skipped after 0.2 s: cold',
+    );
+    expect(
+      eventLine({ type: 'skip', model: 'a', source: 'hosted', reason: 'state too long', ms: 0 }),
+    ).toBe('a skipped: state too long');
+    expect(eventLine({ type: 'retry', reason: 'no decision model answered', maxStateChars: 12000 })).toBe(
+      'retrying with a 12000-char state the fallback model can take (no decision model answered)',
+    );
+  });
+
+  it('names what each model did when the wake-up reached it', () => {
+    expect(wakeLine({ model: 'a', outcome: 'ready' })).toBe('a is already warm');
+    expect(wakeLine({ model: 'a', outcome: 'woken' })).toBe('sent a wake-up to a');
+    expect(wakeLine({ model: 'a', outcome: 'failed', detail: 'ECONNREFUSED' })).toBe(
+      'wake-up to a failed: ECONNREFUSED',
+    );
+    expect(wakeLine({ model: 'a', outcome: 'failed' })).toBe('wake-up to a failed: unknown error');
   });
 });
 
