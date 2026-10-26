@@ -8,7 +8,14 @@ import type {
   TurnCompleteInput,
 } from 'claude-code';
 
-import { CascadeAsker, parseModelList, type CascadeAuth } from '../src/cascade.js';
+import {
+  CascadeAsker,
+  DEFAULT_FALLBACK_MODEL,
+  parseModelList,
+  wakeModels,
+  type CascadeAuth,
+  type FallbackEndpoint,
+} from '../src/cascade.js';
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
 import type {
@@ -22,9 +29,24 @@ import type {
 
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
+  wakeAtPercent: 40,
   minReductionRatio: 0.25,
   model: DEFAULT_MODEL,
 };
+
+/**
+ * State budgets for the decision models when none are configured: under the
+ * 50,000 characters and ~16,000 tokens a typical decision model takes before
+ * it truncates without saying so.
+ */
+export const CASCADE_BUDGETS = {
+  maxStateChars: 48_000,
+  maxStateTokens: 12_000,
+  maxRequestTokens: 14_000,
+};
+
+/** A wake-up repeated inside a model's minutes-long start achieves nothing. */
+const WAKE_EVERY_MS = 5 * 60_000;
 
 export type HookFetchInit = {
   method?: string;
@@ -47,7 +69,11 @@ export type HookConfig = CompactOptions & {
   baseUrl?: string;
   models?: string[];
   authHeader?: CascadeAuth;
+  /** The fallback model, asked when every hosted model is skipped. */
+  fallback?: FallbackEndpoint;
   compactAtPercent: number;
+  /** Context percentage at which cold decision models are sent a wake-up. */
+  wakeAtPercent: number;
   minReductionRatio: number;
   model: string;
 };
@@ -69,6 +95,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     'keepThreshold',
     'preserveRecentMessages',
     'maxStateTokens',
+    'maxStateChars',
     'maxRequestTokens',
     'truncateHeadChars',
   ] as const) {
@@ -78,6 +105,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   const config: HookConfig = {
     ...numbers,
     compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
+    wakeAtPercent: optionNumber(options, 'wakeAtPercent', HOOK_DEFAULTS.wakeAtPercent),
     minReductionRatio: optionNumber(
       options,
       'minReductionRatio',
@@ -173,14 +201,24 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-function askerFor(config: HookConfig, fetchFn: HookFetch): JevAsker {
-  if (config.baseUrl && config.models && config.models.length > 0) {
+function isCascade(config: HookConfig): boolean {
+  return Boolean(config.fallback) || Boolean(config.baseUrl && config.models && config.models.length > 0);
+}
+
+function askerFor(
+  config: HookConfig,
+  fetchFn: HookFetch,
+  sleep?: (ms: number) => Promise<void>,
+): JevAsker {
+  if (isCascade(config)) {
     return new CascadeAsker({
-      apiKey: config.apiKey ?? '',
-      baseUrl: config.baseUrl,
-      models: config.models,
+      ...(config.apiKey ? { apiKey: config.apiKey } : {}),
+      ...(config.baseUrl ? { baseUrl: config.baseUrl } : {}),
+      ...(config.models ? { models: config.models } : {}),
       ...(config.authHeader ? { auth: config.authHeader } : {}),
-      transport: fetchFn,
+      ...(config.fallback ? { fallback: config.fallback } : {}),
+      ...(sleep ? { sleep } : {}),
+      transport: (url, init) => fetchFn(url, init),
     });
   }
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
@@ -192,8 +230,9 @@ export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
+  sleep?: (ms: number) => Promise<void>,
 ): Promise<SessionCompaction> {
-  const result = await compact(messages, askerFor(config, fetchFn), config);
+  const result = await compact(messages, askerFor(config, fetchFn, sleep), config);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -209,9 +248,14 @@ export function summarize(result: CompactResult): string {
     stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
   ].filter(Boolean);
+  const models = Object.entries(stats.models)
+    .map(([model, requests]) => (requests > 1 ? `${model} x${requests}` : model))
+    .join(', ');
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)${
+    models ? ` by ${models}` : ''
+  }`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -264,10 +308,15 @@ async function settingsEnv($: Lookup): Promise<Record<string, string>> {
 }
 
 /**
- * Fills what the plugin options left open. A decision endpoint can come from
- * DECISION_BASE_URL and DECISION_MODELS (a comma list, best first), which keeps
- * an internal URL out of the plugin settings; its key is DECISION_API_KEY.
- * Without both, the key is TYPESAFE_API_KEY and Jev is asked.
+ * Fills what the plugin options left open, choosing between a decision-model
+ * cascade and Jev.
+ *
+ * The hosted chain is DECISION_BASE_URL with DECISION_MODELS (a comma list,
+ * best first) and DECISION_API_KEY, or the `baseUrl`/`models`/`apiKey`
+ * options. DECISION_FALLBACK_URL adds an OpenAI-compatible fallback model
+ * (DECISION_FALLBACK_MODEL, default `Qwen/Qwen3.5-4B`), which also works
+ * alone. Either one switches from Jev, with state budgets a decision model
+ * will not truncate. Otherwise the key is TYPESAFE_API_KEY and Jev is asked.
  */
 export async function resolveRuntimeConfig($: Lookup, configured: HookConfig): Promise<HookConfig> {
   // $.env.get takes a literal name so the host can list what a module reads.
@@ -275,21 +324,40 @@ export async function resolveRuntimeConfig($: Lookup, configured: HookConfig): P
     DECISION_BASE_URL: await $.env.get('DECISION_BASE_URL'),
     DECISION_MODELS: await $.env.get('DECISION_MODELS'),
     DECISION_API_KEY: await $.env.get('DECISION_API_KEY'),
+    DECISION_FALLBACK_URL: await $.env.get('DECISION_FALLBACK_URL'),
+    DECISION_FALLBACK_MODEL: await $.env.get('DECISION_FALLBACK_MODEL'),
     TYPESAFE_API_KEY: await $.env.get('TYPESAFE_API_KEY'),
   };
   const backup = await settingsEnv($);
-  const get = (name: keyof typeof env): string | undefined => env[name] || backup[name] || undefined;
+  const get = (name: keyof typeof env): string | undefined =>
+    env[name]?.trim() || backup[name]?.trim() || undefined;
 
   const config: HookConfig = { ...configured };
   const baseUrl = configured.baseUrl ?? get('DECISION_BASE_URL');
   const models = configured.models ?? parseModelList(get('DECISION_MODELS') ?? '');
-  const cascade = Boolean(baseUrl) && models.length > 0;
-  if (cascade && baseUrl) {
+  const fallbackUrl = get('DECISION_FALLBACK_URL');
+  const hosted = Boolean(baseUrl) && models.length > 0;
+  if (!hosted && !fallbackUrl) {
+    const apiKey = configured.apiKey ?? get('TYPESAFE_API_KEY');
+    if (apiKey) config.apiKey = apiKey;
+    return config;
+  }
+
+  if (hosted && baseUrl) {
     config.baseUrl = baseUrl;
     config.models = models;
+    const apiKey = configured.apiKey ?? get('DECISION_API_KEY');
+    if (apiKey) config.apiKey = apiKey;
   }
-  const apiKey = configured.apiKey ?? get(cascade ? 'DECISION_API_KEY' : 'TYPESAFE_API_KEY');
-  if (apiKey) config.apiKey = apiKey;
+  if (fallbackUrl) {
+    config.fallback = {
+      baseUrl: fallbackUrl,
+      model: get('DECISION_FALLBACK_MODEL') ?? DEFAULT_FALLBACK_MODEL,
+    };
+  }
+  config.maxStateChars ??= CASCADE_BUDGETS.maxStateChars;
+  config.maxStateTokens ??= CASCADE_BUDGETS.maxStateTokens;
+  config.maxRequestTokens ??= CASCADE_BUDGETS.maxRequestTokens;
   return config;
 }
 
@@ -309,14 +377,20 @@ function notify(
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
+  let lastWake = Number.NEGATIVE_INFINITY;
 
   on('session.compact', async ($, event, next) => {
     try {
       const config = await resolveRuntimeConfig($, configured);
-      const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
-        const response = await $.http.fetch(url, init);
-        return { status: response.status, ok: response.ok, text: response.text };
-      });
+      const { result, messages } = await compactSession(
+        event.messages,
+        config,
+        async (url, init) => {
+          const response = await $.http.fetch(url, init);
+          return { status: response.status, ok: response.ok, text: response.text };
+        },
+        (ms) => $.clock.sleep(ms, { signal: next.signal }),
+      );
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(
@@ -343,7 +417,30 @@ export const register: Register = (on: On, options: PluginOptions) => {
     if (compacting) return next(event);
     try {
       const { context } = await $.session.usage();
-      if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
+      const used = context.percent ?? 0;
+      if (used >= configured.wakeAtPercent) {
+        // Models take 7-15 minutes to come up from zero; start them before
+        // compaction needs them rather than when it does.
+        const now = await $.clock.now();
+        const config = await resolveRuntimeConfig($, configured);
+        if (now - lastWake >= WAKE_EVERY_MS && config.apiKey && config.baseUrl && config.models) {
+          lastWake = now;
+          const woken = await wakeModels(
+            {
+              apiKey: config.apiKey,
+              baseUrl: config.baseUrl,
+              models: config.models,
+              ...(config.authHeader ? { auth: config.authHeader } : {}),
+            },
+            async (url, init) => {
+              const response = await $.http.fetch(url, init);
+              return { status: response.status, ok: response.ok, text: response.text };
+            },
+          );
+          if (woken.length > 0) $.ui.log(`sent a wake-up to ${woken.join(', ')}`);
+        }
+      }
+      if (used < configured.compactAtPercent) return next(event);
       compacting = true;
       await $.session.compact();
     } catch (error) {

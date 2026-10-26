@@ -101,6 +101,8 @@ export interface CompactOptions {
   preserveRecentMessages?: number;
   /** Estimated token ceiling for the state. Default 25000. */
   maxStateTokens?: number;
+  /** Character ceiling for the serialised state. Default unlimited. */
+  maxStateChars?: number;
   /** Estimated token ceiling for state plus one batch of questions. Default 30000. */
   maxRequestTokens?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
@@ -112,6 +114,7 @@ export interface ResolvedCompactOptions {
   keepThreshold: number;
   preserveRecentMessages: number;
   maxStateTokens: number;
+  maxStateChars: number;
   maxRequestTokens: number;
   truncateHeadChars: number;
 }
@@ -134,6 +137,8 @@ export interface CompactResult {
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;
     requests: number;
+    /** Requests answered per model, by the name it reported. */
+    models: Record<string, number>;
     ms: number;
   };
 }

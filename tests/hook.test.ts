@@ -7,8 +7,15 @@ import {
   resolveRuntimeConfig,
   summarize,
   toSessionMessages,
+  CASCADE_BUDGETS,
 } from '../hooks/fast-jev.ts';
-import { applyDecisions, collectToolCalls, decideCall, type Message } from '../src/index.js';
+import {
+  applyDecisions,
+  collectToolCalls,
+  decideCall,
+  DEFAULT_FALLBACK_MODEL,
+  type Message,
+} from '../src/index.js';
 
 type SessionMessage = Message & { handle?: string };
 
@@ -54,7 +61,12 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'jev-latest' });
+    expect(resolveHookConfig({})).toEqual({
+      compactAtPercent: 60,
+      wakeAtPercent: 40,
+      minReductionRatio: 0.25,
+      model: 'jev-latest',
+    });
     expect(
       resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
     ).toEqual({
@@ -64,6 +76,7 @@ describe('hook config', () => {
       model: 'jev-x',
       goal: 'g',
       compactAtPercent: 60,
+      wakeAtPercent: 40,
       minReductionRatio: 0.25,
     });
   });
@@ -183,14 +196,62 @@ describe('decision endpoint', () => {
     expect(fromSettings).toMatchObject({ models: ['a'], apiKey: 'sk' });
   });
 
-  it('stays on Jev and its key unless both a URL and a model are set', async () => {
-    const jev = await resolveRuntimeConfig(
-      host({ DECISION_BASE_URL: 'https://decide.test', DECISION_API_KEY: 'dk', TYPESAFE_API_KEY: 'tk' }),
-      resolveHookConfig({}),
-    );
+  it('stays on Jev and its key when nothing of the cascade is configured', async () => {
+    const jev = await resolveRuntimeConfig(host({ TYPESAFE_API_KEY: 'tk' }), resolveHookConfig({}));
     expect(jev).toMatchObject({ apiKey: 'tk' });
     expect(jev.baseUrl).toBeUndefined();
     expect(jev.models).toBeUndefined();
+    expect(jev.maxStateChars).toBeUndefined();
+  });
+
+  it('sets cascade state budgets for a hosted chain', async () => {
+    const config = await resolveRuntimeConfig(
+      host({ DECISION_BASE_URL: 'https://decide.test', DECISION_MODELS: 'a', DECISION_API_KEY: 'dk', TYPESAFE_API_KEY: 'tk' }),
+      resolveHookConfig({}),
+    );
+    expect(config).toMatchObject({ apiKey: 'dk', models: ['a'], ...CASCADE_BUDGETS });
+    expect(config.fallback).toBeUndefined();
+  });
+
+  it('adds the fallback model from DECISION_FALLBACK_URL, and keeps budgets the user set', async () => {
+    const config = await resolveRuntimeConfig(
+      host({ DECISION_FALLBACK_URL: 'http://fallback.test:8000/', DECISION_FALLBACK_MODEL: ' ' }),
+      resolveHookConfig({ maxStateTokens: 9000 }),
+    );
+    expect(config.fallback).toEqual({ baseUrl: 'http://fallback.test:8000/', model: DEFAULT_FALLBACK_MODEL });
+    expect(config.baseUrl).toBeUndefined();
+    expect(config.apiKey).toBeUndefined();
+    expect(config.maxStateTokens).toBe(9000);
+    expect(config.maxStateChars).toBe(CASCADE_BUDGETS.maxStateChars);
+  });
+
+  it('answers from the fallback model when no hosted chain is set', async () => {
+    const config = {
+      ...resolveHookConfig({ preserveRecentMessages: 1 }),
+      fallback: { baseUrl: 'http://fallback.test', model: 'q' },
+    };
+    const urls: string[] = [];
+    const { result: output } = await compactSession(transcript(), config, async (url, init) => {
+      urls.push(url);
+      const { messages } = JSON.parse(init?.body ?? '{}') as { messages: { content: string }[] };
+      const yes = /^(Tool call|The full output of tool call) t2 /.test(messages[0]!.content);
+      const token = yes ? 'yes' : 'no';
+      return {
+        status: 200,
+        ok: true,
+        text: JSON.stringify({
+          choices: [
+            {
+              message: { content: token },
+              logprobs: { content: [{ token, top_logprobs: [{ token, logprob: Math.log(0.9) }, { token: yes ? 'no' : 'yes', logprob: Math.log(0.1) }] }] },
+            },
+          ],
+        }),
+      };
+    });
+    expect(new Set(urls)).toEqual(new Set(['http://fallback.test/v1/chat/completions']));
+    expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
+    expect(summarize(output)).toMatch(/ by fallback:q$/);
   });
 
   it('asks the models in order over the engine fetch and skips the cold one', async () => {

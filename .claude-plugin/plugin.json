@@ -1,13 +1,13 @@
 {
   "name": "fast-jev-compaction",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
   "license": "MIT",
   "userConfig": {
     "apiKey": {
       "type": "string",
       "title": "API key",
-      "description": "Key for Jev (TypeSafe), or for the decision endpoint when baseUrl and models are set. Leave unset to use TYPESAFE_API_KEY, or DECISION_API_KEY for a decision endpoint.",
+      "description": "Key for Jev (TypeSafe), or for the decision endpoint when the decision cascade is used. Leave unset to use TYPESAFE_API_KEY, or DECISION_API_KEY for the decision endpoint.",
       "sensitive": true
     },
     "keepThreshold": {
@@ -28,6 +28,12 @@
       "description": "Context percentage at which turn.complete requests compaction.",
       "default": 60
     },
+    "wakeAtPercent": {
+      "type": "number",
+      "title": "Wake-up percentage",
+      "description": "Context percentage at which cold decision models are sent a wake-up (at most every 5 minutes), so they are warm by compaction. They take 7-15 minutes to start.",
+      "default": 40
+    },
     "minReductionRatio": {
       "type": "number",
       "title": "Minimum reduction ratio",
@@ -37,14 +43,17 @@
     "maxStateTokens": {
       "type": "number",
       "title": "Maximum Jev state tokens",
-      "description": "Estimated token budget for the conversation state sent with every Jev request.",
-      "default": 25000
+      "description": "Estimated token budget for the conversation state sent with every request. Default 25000 for Jev, 12000 for the decision cascade."
+    },
+    "maxStateChars": {
+      "type": "number",
+      "title": "Maximum state characters",
+      "description": "Character budget for the serialised state. Unlimited for Jev; 48000 for a decision-model cascade, so a model does not silently truncate it."
     },
     "maxRequestTokens": {
       "type": "number",
       "title": "Maximum Jev request tokens",
-      "description": "Estimated token budget for state plus questions in one Jev request.",
-      "default": 30000
+      "description": "Estimated token budget for state plus questions in one request. Default 30000 for Jev, 14000 for the decision cascade."
     },
     "truncateHeadChars": {
       "type": "number",

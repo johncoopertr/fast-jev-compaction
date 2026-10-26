@@ -1,4 +1,4 @@
-import type { CascadeTransport } from './cascade.js';
+import { PER_MODEL_TIMEOUT_MS, type CascadeTransport } from './cascade.js';
 import { buildJevRequest, parseJevResponse } from './request.js';
 import type { JevAsker, JevQuestions, JevResponse, JevState } from './types.js';
 
@@ -43,10 +43,13 @@ export class JevClient implements JevAsker {
   }
 }
 
-/** A `CascadeTransport` over the global `fetch` (or an injected one). */
-export function fetchTransport(fetcher: typeof fetch = fetch): CascadeTransport {
+/** A `CascadeTransport` over the global `fetch` (or an injected one), giving up after `timeoutMs`. */
+export function fetchTransport(
+  fetcher: typeof fetch = fetch,
+  timeoutMs: number = PER_MODEL_TIMEOUT_MS,
+): CascadeTransport {
   return async (url, init) => {
-    const response = await fetcher(url, init);
+    const response = await fetcher(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
     return { status: response.status, ok: response.ok, text: await response.text() };
   };
 }

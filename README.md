@@ -108,6 +108,7 @@ put it in a source file.
 | `keepThreshold` | `0.5` | Minimum keep probability for a call or result to stay |
 | `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
 | `maxStateTokens` | `25000` | Estimated token ceiling for the state |
+| `maxStateChars` | unlimited | Character ceiling for the serialised state |
 | `maxRequestTokens` | `30000` | Estimated ceiling for state plus one batch of questions |
 | `truncateHeadChars` | `300` | Characters of a dropped tool result retained before its note |
 
@@ -162,10 +163,11 @@ To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 
 from the repository root. No publishing step is required; the marketplace is
 just the repo's `.claude-plugin/marketplace.json`.
 
-### Decision endpoint instead of Jev
+### Decision-model cascade instead of Jev
 
-The plugin can ask a chain of decision models instead of Jev. The endpoint must
-take the same body (`{ state, questions }` with `noul` questions) and answer
+The plugin can ask a chain of decision models instead of Jev, with an optional
+fallback model on an OpenAI-compatible server. The endpoint must take the same
+body (`{ state, questions }` with `noul` questions) and answer
 `{ answers: { name: { noul } } }`, with each model served at
 `{baseUrl}/{model}`. Set it in the environment (or the plugin options
 `baseUrl`, `models`, `authHeader`):
@@ -174,20 +176,39 @@ take the same body (`{ state, questions }` with `noul` questions) and answer
 export DECISION_BASE_URL="https://decide.example.com/v1"
 export DECISION_MODELS="model-a,model-b,model-c"   # best first
 export DECISION_API_KEY="<key>"                    # sent as x-api-key
+# Optional last resort, also usable alone:
+export DECISION_FALLBACK_URL="http://fallback.example:8000"
+export DECISION_FALLBACK_MODEL="Qwen/Qwen3.5-4B"   # the default
 ```
 
-Models are tried in order and the first complete answer wins. A cold model
-answers `503` while it scales up, which takes minutes, so it is skipped at once
-rather than waited on; a failed request, malformed JSON or an answer missing a
-question skips a model too. When none answers the hook falls back to Claude
-Code's built-in summary. With both a URL and at least one model set, Jev is not
-asked at all; the key is `DECISION_API_KEY`, not `TYPESAFE_API_KEY`. In code,
-use `new CascadeAsker({ apiKey, baseUrl, models, transport: fetchTransport() })`
-with `compact()`.
+- Models are tried in order and the first complete answer wins. A cold model
+  answers `503` while it scales up, which can take many minutes, so it is
+  skipped at once rather than waited on. A timeout (12 s), a failed request,
+  malformed JSON or an answer missing a question skips a model too.
+- Each request carries at most 8 questions and a state of at most 50,000
+  characters, so a model never silently truncates the history; a longer state
+  skips the model without a request. `CascadeOptions.limits` sets these per
+  model. The cascade fits the state into `maxStateChars` (48,000) and
+  `maxStateTokens` (12,000) by default.
+- Requests go one at a time.
+- When every hosted model is skipped, the fallback model is asked, if the state
+  is at most 20,000 characters (an 8k-token context refuses longer ones). It
+  gets one chat call per question, constrained to `yes`/`no`, and the logprob
+  mass on its answer is taken as the probability. That number separates right
+  from wrong answers less sharply than the hosted models' do. A reply with no
+  logprobs, or naming no option, fails the request rather than deleting on a
+  guess.
+- From `wakeAtPercent` (40%) of context, at most every five minutes, the hook
+  sends cold hosted models a wake-up, so they are warm by the time compaction
+  runs at `compactAtPercent`.
+- When nothing answers, the hook falls back to Claude Code's built-in summary.
+  The toast names the model(s) that answered.
 
-Things to check before relying on it: the endpoint must accept a state as large
-as `maxStateTokens` (lower it if not), and `keepThreshold` was tuned for Jev,
-so a model whose probabilities are less sharp may want a different value.
+In code, use `new CascadeAsker({ apiKey, baseUrl, models, fallback, transport: fetchTransport() })`
+with `compact()`, and pass `maxStateChars` to `compact()`.
+
+`keepThreshold` was tuned for Jev; other models' probabilities are shaped
+differently, so it may want retuning.
 
 ## Development
 

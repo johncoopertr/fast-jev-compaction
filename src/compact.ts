@@ -19,6 +19,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
   maxStateTokens: 25_000,
+  maxStateChars: Number.POSITIVE_INFINITY,
   maxRequestTokens: 30_000,
   truncateHeadChars: 300,
 };
@@ -41,6 +42,7 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
       ),
     ),
     maxStateTokens: Math.max(1, finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
+    maxStateChars: Math.max(1, options.maxStateChars ?? DEFAULT_OPTIONS.maxStateChars),
     maxRequestTokens: Math.max(
       1,
       finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens),
@@ -118,18 +120,21 @@ async function askBatch(
   asker: JevAsker,
   state: CompactionState,
   batch: readonly ToolCall[],
-): Promise<Map<string, CallAnswer>> {
+): Promise<{ model: string | undefined; answers: Map<string, CallAnswer> }> {
   const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
-  const { answers } = await asker.ask(state, questions);
-  return new Map(
-    batch.map((call) => [
-      call.id,
-      {
-        keepCall: noulAnswer(answers, `call_${call.id}`),
-        keepResult: noulAnswer(answers, `result_${call.id}`),
-      },
-    ]),
-  );
+  const { answers, model } = await asker.ask(state, questions);
+  return {
+    model: typeof model === 'string' ? model : undefined,
+    answers: new Map(
+      batch.map((call) => [
+        call.id,
+        {
+          keepCall: noulAnswer(answers, `call_${call.id}`),
+          keepResult: noulAnswer(answers, `result_${call.id}`),
+        },
+      ]),
+    ),
+  };
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
@@ -268,6 +273,7 @@ export async function compact(
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let batches: ToolCall[][] = [];
   const answers = new Map<string, CallAnswer>();
+  const models: Record<string, number> = {};
   if (candidates.length > 0) {
     const state = fitState(messages, calls, resolved);
     fitted = state;
@@ -275,7 +281,10 @@ export async function compact(
     const answered = await Promise.all(
       batches.map((batch) => askBatch(asker, state.state, batch)),
     );
-    for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
+    for (const batch of answered) {
+      if (batch.model) models[batch.model] = (models[batch.model] ?? 0) + 1;
+      for (const [id, answer] of batch.answers) answers.set(id, answer);
+    }
   }
 
   const decisions = calls.map((call) =>
@@ -303,6 +312,7 @@ export async function compact(
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,
+      models,
       ms: Date.now() - started,
     },
   };

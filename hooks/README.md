@@ -51,9 +51,11 @@ The plugin declares these `userConfig` values in
 | `keepThreshold` | `0.5` |
 | `preserveRecentMessages` | `6` |
 | `compactAtPercent` | `60` |
+| `wakeAtPercent` | `40` |
 | `minReductionRatio` | `0.25` |
-| `maxStateTokens` | `25000` |
-| `maxRequestTokens` | `30000` |
+| `maxStateTokens` | `25000` (cascade: `12000`) |
+| `maxStateChars` | unlimited (cascade: `48000`) |
+| `maxRequestTokens` | `30000` (cascade: `14000`) |
 | `truncateHeadChars` | `300` |
 | `model` | `jev-latest` |
 | `baseUrl` | unset |
@@ -64,13 +66,14 @@ The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended
 development setup.
 
-`baseUrl` and `models` (a comma list, best first) switch from Jev to a decision
-endpoint that serves each model at `{baseUrl}/{model}`; they can also come from
-`DECISION_BASE_URL` and `DECISION_MODELS`, with the key in `DECISION_API_KEY`.
-A cold model (HTTP 503) is skipped, and when no model answers the hook falls
-back to the built-in summary. See the root README.
+`DECISION_BASE_URL` with `DECISION_MODELS` (key in `DECISION_API_KEY`), or the
+`baseUrl`/`models` options, switch from Jev to a decision-model cascade;
+`DECISION_FALLBACK_URL` adds a fallback model and also works alone. A cold model (HTTP 503) is skipped, the cascade sends one request at a
+time, and when no model answers the hook falls back to the built-in summary.
+From `wakeAtPercent` the `turn.complete` hook wakes cold models, at most every
+five minutes. See the root README.
 
-Every option except `apiKey`, `compactAtPercent`, `minReductionRatio`, `model`,
+Every option except `apiKey`, `compactAtPercent`, `wakeAtPercent`, `minReductionRatio`, `model`,
 `baseUrl`, `models` and `authHeader` is passed straight to the library; see the root README for what they
 do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
 the response is malformed, the key is unavailable, the history cannot be
