@@ -160,6 +160,36 @@ describe('compactSession', () => {
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
   });
+
+  it('retries with a state the fallback can take when every hosted model is cold', async () => {
+    const big: SessionMessage[] = [message('user', 'start')];
+    for (let i = 0; i < 40; i += 1) {
+      big.push(call(`b${i}`, 'Bash', { command: 'x'.repeat(1000) }, `run ${i}`));
+      big.push(result(`b${i}`, 'out'.repeat(100)));
+    }
+    big.push(message('assistant', 'done'), message('user', 'next'));
+    const config = {
+      ...resolveHookConfig({ preserveRecentMessages: 2 }),
+      apiKey: 'k',
+      baseUrl: 'https://decide.test/v1',
+      models: ['cold'],
+      fallback: { baseUrl: 'http://fallback.test', model: 'q' },
+      maxStateChars: 48_000,
+      maxStateTokens: 12_000,
+      maxRequestTokens: 14_000,
+    };
+    const urls: string[] = [];
+    const fetchFn = async (url: string, init?: { body?: string }) => {
+      urls.push(url);
+      if (url.startsWith('https://decide.test')) return { status: 503, ok: false, text: 'COLD_START' };
+      const reply = { choices: [{ message: { content: 'no' }, logprobs: { content: [{ token: 'no', top_logprobs: [{ token: 'no', logprob: -0.1 }, { token: 'yes', logprob: -2.5 }] }] } }] };
+      expect(init?.body?.length ?? 0).toBeLessThan(20_000);
+      return { status: 200, ok: true, text: JSON.stringify(reply) };
+    };
+    const { result: output } = await compactSession(big, config, fetchFn);
+    expect(summarize(output)).toMatch(/ by fallback:q/);
+    expect(urls.some((url) => url.startsWith('http://fallback.test'))).toBe(true);
+  });
 });
 
 describe('decision endpoint', () => {

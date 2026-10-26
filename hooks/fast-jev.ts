@@ -232,8 +232,37 @@ export async function compactSession(
   fetchFn: HookFetch,
   sleep?: (ms: number) => Promise<void>,
 ): Promise<SessionCompaction> {
-  const result = await compact(messages, askerFor(config, fetchFn, sleep), config);
-  return { result, messages: toSessionMessages(messages, result.messages) };
+  try {
+    const result = await compact(messages, askerFor(config, fetchFn, sleep), config);
+    return { result, messages: toSessionMessages(messages, result.messages) };
+  } catch (error) {
+    // Every hosted model cold or failing, and the fallback skipped because the
+    // state was sized for the hosted models: ask again with a state the
+    // fallback model can take, so a cold cascade still yields a real decision.
+    const smaller = fallbackSized(config);
+    if (!smaller) throw error;
+    const result = await compact(messages, askerFor(smaller, fetchFn, sleep), smaller);
+    return { result, messages: toSessionMessages(messages, result.messages) };
+  }
+}
+
+/** State budgets a small fallback model (8k-token context) can answer. */
+const FALLBACK_BUDGETS = { maxStateChars: 12_000, maxStateTokens: 5_000, maxRequestTokens: 6_000 };
+
+/** The config with budgets cut to the fallback's, or `undefined` when there is no fallback or nothing to cut. */
+function fallbackSized(config: HookConfig): HookConfig | undefined {
+  if (!config.fallback) return undefined;
+  const smaller: HookConfig = {
+    ...config,
+    maxStateChars: Math.min(config.maxStateChars ?? Infinity, FALLBACK_BUDGETS.maxStateChars),
+    maxStateTokens: Math.min(config.maxStateTokens ?? Infinity, FALLBACK_BUDGETS.maxStateTokens),
+    maxRequestTokens: Math.min(config.maxRequestTokens ?? Infinity, FALLBACK_BUDGETS.maxRequestTokens),
+  };
+  const same =
+    smaller.maxStateChars === config.maxStateChars &&
+    smaller.maxStateTokens === config.maxStateTokens &&
+    smaller.maxRequestTokens === config.maxRequestTokens;
+  return same ? undefined : smaller;
 }
 
 function percent(ratio: number): string {
