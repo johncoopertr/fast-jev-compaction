@@ -8,6 +8,7 @@ import type {
   TurnCompleteInput,
 } from 'claude-code';
 
+import { CascadeAsker, parseModelList, type CascadeAuth } from '../src/cascade.js';
 import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
 import type {
@@ -42,6 +43,10 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  /** With `models`, asks that decision endpoint's models in order instead of Jev. */
+  baseUrl?: string;
+  models?: string[];
+  authHeader?: CascadeAuth;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
@@ -82,6 +87,13 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   };
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
+  const baseUrl = optionString(options, 'baseUrl');
+  if (baseUrl) config.baseUrl = baseUrl;
+  const modelList = optionString(options, 'models');
+  const models = modelList ? parseModelList(modelList) : [];
+  if (models.length > 0) config.models = models;
+  const authHeader = optionString(options, 'authHeader');
+  if (authHeader === 'x-api-key' || authHeader === 'bearer') config.authHeader = authHeader;
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
@@ -161,14 +173,27 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-/** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
+function askerFor(config: HookConfig, fetchFn: HookFetch): JevAsker {
+  if (config.baseUrl && config.models && config.models.length > 0) {
+    return new CascadeAsker({
+      apiKey: config.apiKey ?? '',
+      baseUrl: config.baseUrl,
+      models: config.models,
+      ...(config.authHeader ? { auth: config.authHeader } : {}),
+      transport: fetchFn,
+    });
+  }
+  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
+  return jevAsker(fetchFn, config.apiKey, config.model);
+}
+
+/** Runs the library over a session transcript; throws when the key is missing or no model answers. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const result = await compact(messages, askerFor(config, fetchFn), config);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -224,23 +249,48 @@ export function decisionLogLines(
   );
 }
 
-async function getApiKey(
-  $: {
-    env: { get: (name: string) => Promise<string | undefined> };
-    settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
-  },
-  config: HookConfig,
-): Promise<string | undefined> {
-  if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
-  if (fromEnv) return fromEnv;
-  const settings = await $.settings.read();
-  const env = settings['env'];
-  if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
-    if (typeof value === 'string' && value) return value;
+type Lookup = {
+  env: { get: (name: string) => Promise<string | undefined> };
+  settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
+};
+
+/** `env` in the Claude Code settings, which backs up the process environment. */
+async function settingsEnv($: Lookup): Promise<Record<string, string>> {
+  const env = (await $.settings.read())['env'];
+  if (!env || typeof env !== 'object') return {};
+  return Object.fromEntries(
+    Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
+  );
+}
+
+/**
+ * Fills what the plugin options left open. A decision endpoint can come from
+ * DECISION_BASE_URL and DECISION_MODELS (a comma list, best first), which keeps
+ * an internal URL out of the plugin settings; its key is DECISION_API_KEY.
+ * Without both, the key is TYPESAFE_API_KEY and Jev is asked.
+ */
+export async function resolveRuntimeConfig($: Lookup, configured: HookConfig): Promise<HookConfig> {
+  // $.env.get takes a literal name so the host can list what a module reads.
+  const env = {
+    DECISION_BASE_URL: await $.env.get('DECISION_BASE_URL'),
+    DECISION_MODELS: await $.env.get('DECISION_MODELS'),
+    DECISION_API_KEY: await $.env.get('DECISION_API_KEY'),
+    TYPESAFE_API_KEY: await $.env.get('TYPESAFE_API_KEY'),
+  };
+  const backup = await settingsEnv($);
+  const get = (name: keyof typeof env): string | undefined => env[name] || backup[name] || undefined;
+
+  const config: HookConfig = { ...configured };
+  const baseUrl = configured.baseUrl ?? get('DECISION_BASE_URL');
+  const models = configured.models ?? parseModelList(get('DECISION_MODELS') ?? '');
+  const cascade = Boolean(baseUrl) && models.length > 0;
+  if (cascade && baseUrl) {
+    config.baseUrl = baseUrl;
+    config.models = models;
   }
-  return undefined;
+  const apiKey = configured.apiKey ?? get(cascade ? 'DECISION_API_KEY' : 'TYPESAFE_API_KEY');
+  if (apiKey) config.apiKey = apiKey;
+  return config;
 }
 
 function notify(
@@ -262,7 +312,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
+      const config = await resolveRuntimeConfig($, configured);
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
