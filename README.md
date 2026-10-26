@@ -162,6 +162,33 @@ To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 
 from the repository root. No publishing step is required; the marketplace is
 just the repo's `.claude-plugin/marketplace.json`.
 
+### Decision endpoint instead of Jev
+
+The plugin can ask a chain of decision models instead of Jev. The endpoint must
+take the same body (`{ state, questions }` with `noul` questions) and answer
+`{ answers: { name: { noul } } }`, with each model served at
+`{baseUrl}/{model}`. Set it in the environment (or the plugin options
+`baseUrl`, `models`, `authHeader`):
+
+```sh
+export DECISION_BASE_URL="https://decide.example.com/v1"
+export DECISION_MODELS="model-a,model-b,model-c"   # best first
+export DECISION_API_KEY="<key>"                    # sent as x-api-key
+```
+
+Models are tried in order and the first complete answer wins. A cold model
+answers `503` while it scales up, which takes minutes, so it is skipped at once
+rather than waited on; a failed request, malformed JSON or an answer missing a
+question skips a model too. When none answers the hook falls back to Claude
+Code's built-in summary. With both a URL and at least one model set, Jev is not
+asked at all; the key is `DECISION_API_KEY`, not `TYPESAFE_API_KEY`. In code,
+use `new CascadeAsker({ apiKey, baseUrl, models, transport: fetchTransport() })`
+with `compact()`.
+
+Things to check before relying on it: the endpoint must accept a state as large
+as `maxStateTokens` (lower it if not), and `keepThreshold` was tuned for Jev,
+so a model whose probabilities are less sharp may want a different value.
+
 ## Development
 
 ```sh

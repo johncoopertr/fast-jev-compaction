@@ -56,13 +56,22 @@ The plugin declares these `userConfig` values in
 | `maxRequestTokens` | `30000` |
 | `truncateHeadChars` | `300` |
 | `model` | `jev-latest` |
+| `baseUrl` | unset |
+| `models` | unset |
+| `authHeader` | `x-api-key` |
 
 The TypeSafe key can be supplied as the sensitive `apiKey` plugin option or
 through `TYPESAFE_API_KEY`. The environment variable is the recommended
 development setup.
 
-Every option except `apiKey`, `compactAtPercent`, `minReductionRatio` and
-`model` is passed straight to the library; see the root README for what they
+`baseUrl` and `models` (a comma list, best first) switch from Jev to a decision
+endpoint that serves each model at `{baseUrl}/{model}`; they can also come from
+`DECISION_BASE_URL` and `DECISION_MODELS`, with the key in `DECISION_API_KEY`.
+A cold model (HTTP 503) is skipped, and when no model answers the hook falls
+back to the built-in summary. See the root README.
+
+Every option except `apiKey`, `compactAtPercent`, `minReductionRatio`, `model`,
+`baseUrl`, `models` and `authHeader` is passed straight to the library; see the root README for what they
 do. The `session.compact` hook runs the Jev requests concurrently. If Jev fails,
 the response is malformed, the key is unavailable, the history cannot be
 fitted into the state budget, or the estimated reduction is below

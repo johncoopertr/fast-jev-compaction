@@ -1,3 +1,4 @@
+import type { CascadeTransport } from './cascade.js';
 import { buildJevRequest, parseJevResponse } from './request.js';
 import type { JevAsker, JevQuestions, JevResponse, JevState } from './types.js';
 
@@ -40,4 +41,12 @@ export class JevClient implements JevAsker {
     });
     return parseJevResponse(response.status, response.ok, await response.text());
   }
+}
+
+/** A `CascadeTransport` over the global `fetch` (or an injected one). */
+export function fetchTransport(fetcher: typeof fetch = fetch): CascadeTransport {
+  return async (url, init) => {
+    const response = await fetcher(url, init);
+    return { status: response.status, ok: response.ok, text: await response.text() };
+  };
 }

@@ -4,6 +4,7 @@ import {
   decisionLog,
   decisionLogLines,
   resolveHookConfig,
+  resolveRuntimeConfig,
   summarize,
   toSessionMessages,
 } from '../hooks/fast-jev.ts';
@@ -145,5 +146,76 @@ describe('compactSession', () => {
     await expect(
       compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
+  });
+});
+
+describe('decision endpoint', () => {
+  const endpoint = { baseUrl: 'https://decide.test/v1', models: 'cold, warm' };
+
+  it('reads the endpoint options and ignores an unknown auth style', () => {
+    expect(resolveHookConfig({ ...endpoint, authHeader: 'bearer' })).toMatchObject({
+      baseUrl: 'https://decide.test/v1',
+      models: ['cold', 'warm'],
+      authHeader: 'bearer',
+    });
+    expect(resolveHookConfig({ ...endpoint, authHeader: 'basic' }).authHeader).toBeUndefined();
+    expect(resolveHookConfig({ baseUrl: '', models: ' , ' })).toEqual(resolveHookConfig({}));
+  });
+
+  function host(env: Record<string, string>, settingsEnv: Record<string, string> = {}) {
+    return {
+      env: { get: async (name: string) => env[name] },
+      settings: { read: async () => ({ env: settingsEnv }) },
+    };
+  }
+
+  it('takes the endpoint and its key from the environment, then from settings', async () => {
+    const configured = resolveHookConfig({});
+    const fromEnv = await resolveRuntimeConfig(
+      host({ DECISION_BASE_URL: 'https://decide.test', DECISION_MODELS: 'a,b', DECISION_API_KEY: 'dk' }),
+      configured,
+    );
+    expect(fromEnv).toMatchObject({ baseUrl: 'https://decide.test', models: ['a', 'b'], apiKey: 'dk' });
+    const fromSettings = await resolveRuntimeConfig(
+      host({}, { DECISION_BASE_URL: 'https://decide.test', DECISION_MODELS: 'a', DECISION_API_KEY: 'sk' }),
+      configured,
+    );
+    expect(fromSettings).toMatchObject({ models: ['a'], apiKey: 'sk' });
+  });
+
+  it('stays on Jev and its key unless both a URL and a model are set', async () => {
+    const jev = await resolveRuntimeConfig(
+      host({ DECISION_BASE_URL: 'https://decide.test', DECISION_API_KEY: 'dk', TYPESAFE_API_KEY: 'tk' }),
+      resolveHookConfig({}),
+    );
+    expect(jev).toMatchObject({ apiKey: 'tk' });
+    expect(jev.baseUrl).toBeUndefined();
+    expect(jev.models).toBeUndefined();
+  });
+
+  it('asks the models in order over the engine fetch and skips the cold one', async () => {
+    const urls: string[] = [];
+    const headers: Record<string, string>[] = [];
+    const config = {
+      ...resolveHookConfig({ ...endpoint, preserveRecentMessages: 1 }),
+      apiKey: 'dk',
+    };
+    const warm = jevFetch((name) => (name === 'call_t2' || name === 'result_t2' ? 0.9 : 0.1));
+    const { result: output } = await compactSession(transcript(), config, async (url, init) => {
+      urls.push(url);
+      headers.push(init?.headers ?? {});
+      if (url.endsWith('/cold')) return { status: 503, ok: false, text: 'scaling' };
+      return warm(url, init);
+    });
+    expect(urls).toEqual(['https://decide.test/v1/cold', 'https://decide.test/v1/warm']);
+    expect(headers[1]).toMatchObject({ 'x-api-key': 'dk' });
+    expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
+  });
+
+  it('throws when no model answers so the hook falls back to the built-in summary', async () => {
+    const config = { ...resolveHookConfig({ ...endpoint, preserveRecentMessages: 1 }), apiKey: 'dk' };
+    await expect(
+      compactSession(transcript(), config, async () => ({ status: 503, ok: false, text: '' })),
+    ).rejects.toThrow(/no decision model answered \(cold: cold; warm: cold\)/);
   });
 });

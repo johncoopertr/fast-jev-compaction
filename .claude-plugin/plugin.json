@@ -6,8 +6,8 @@
   "userConfig": {
     "apiKey": {
       "type": "string",
-      "title": "TypeSafe API key",
-      "description": "TypeSafe API key. Leave unset to use TYPESAFE_API_KEY.",
+      "title": "API key",
+      "description": "Key for Jev (TypeSafe), or for the decision endpoint when baseUrl and models are set. Leave unset to use TYPESAFE_API_KEY, or DECISION_API_KEY for a decision endpoint.",
       "sensitive": true
     },
     "keepThreshold": {
@@ -57,6 +57,22 @@
       "title": "Jev model",
       "description": "TypeSafe Jev model name.",
       "default": "jev-latest"
+    },
+    "baseUrl": {
+      "type": "string",
+      "title": "Decision endpoint URL",
+      "description": "Base URL of a decision endpoint that serves each model at {baseUrl}/{model}. With models, replaces Jev. Leave unset to use DECISION_BASE_URL."
+    },
+    "models": {
+      "type": "string",
+      "title": "Decision models",
+      "description": "Comma-separated models to try in order, best first; a cold model (HTTP 503) is skipped, never waited on. Leave unset to use DECISION_MODELS."
+    },
+    "authHeader": {
+      "type": "string",
+      "title": "Decision endpoint auth",
+      "description": "How the key is sent: 'x-api-key' (default) or 'bearer'.",
+      "default": "x-api-key"
     }
   }
 }
